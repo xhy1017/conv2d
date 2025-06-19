@@ -1,0 +1,64 @@
+extern "C" __global__ void myKernelConv2dGpu(mykernelParamType param) __attribute__((amdgpu_flat_work_group_size(1,256)))
+{
+    // block分配
+    int batch = blockIdx.z;      // batch
+    int out_c = blockIdx.y;      // output channel
+    int tile_oh = blockIdx.x / ((param.Ow + 15) / 16);
+    int tile_ow = blockIdx.x % ((param.Ow + 15) / 16);
+
+    int thread_oh = threadIdx.y;
+    int thread_ow = threadIdx.x;
+
+    int oh = tile_oh * 16 + thread_oh;
+    int ow = tile_ow * 16 + thread_ow;
+
+    // 共享内存tile
+    __shared__ _Float16 smem_in[32][32];   // 假设最大输入patch为32x32（可根据实际卷积参数调整）
+    __shared__ _Float16 smem_wei[32][32];  // 假设最大卷积核为32x32
+
+    // 1. 加载输入patch到shared memory
+    for(int c = 0; c < param.c; ++c) {
+        int in_h = oh * param.u - param.p;
+        int in_w = ow * param.v - param.q;
+        for(int kh = 0; kh < param.r; ++kh) {
+            for(int kw = 0; kw < param.s; ++kw) {
+                int ih = in_h + kh;
+                int iw = in_w + kw;
+                _Float16 val = 0;
+                if(ih >= 0 && ih < param.h && iw >= 0 && iw < param.w) {
+                    val = param.pin[batch * param.c * param.h * param.w + c * param.h * param.w + ih * param.w + iw];
+                }
+                if(thread_oh < param.r && thread_ow < param.s) {
+                    smem_in[kh][kw] = val;
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // 2. 加载权重到shared memory
+    for(int c = 0; c < param.c; ++c) {
+        for(int kh = 0; kh < param.r; ++kh) {
+            for(int kw = 0; kw < param.s; ++kw) {
+                if(thread_oh < param.r && thread_ow < param.s) {
+                    smem_wei[kh][kw] = param.pweight[out_c * param.c * param.r * param.s + c * param.r * param.s + kh * param.s + kw];
+                }
+            }
+        }
+    }
+    __syncthreads();
+
+    // 3. 计算卷积
+    if(oh < param.Oh && ow < param.Ow && out_c < param.k && batch < param.n) {
+        float sum = 0.0f;
+        for(int c = 0; c < param.c; ++c) {
+            for(int kh = 0; kh < param.r; ++kh) {
+                for(int kw = 0; kw < param.s; ++kw) {
+                    sum += (float)smem_in[kh][kw] * (float)smem_wei[kh][kw];
+                }
+            }
+        }
+        int outOffset = batch * param.k * param.Oh * param.Ow + out_c * param.Oh * param.Ow + oh * param.Ow + ow;
+        param.pout[outOffset] = (_Float16)sum;
+    }
+}
